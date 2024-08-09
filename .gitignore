@@ -1,3 +1,5 @@
 .env
 *.exe
 usermanager
+
+.DS_Store
