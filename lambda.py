@@ -123,6 +123,20 @@ def log_activity(user_id, message, timestamp, ip):
     except ClientError as e:
         print(f"Error in log_activity: {str(e)}")
 
+def get_auth_logs(user_id):
+    try:
+        response = dynamodb_operation(AUTH_LOGS_TABLE, 'query',
+            KeyConditionExpression='userId = :userId',
+            ExpressionAttributeValues={
+                ':userId': user_id,
+            },
+        )
+        return response.get('Items', [])
+    except ClientError as e:
+        print(f"Error in get_auth_logs: {str(e)}")
+        raise
+
+
 def validate_body(body, required_params):
     missing = [param for param in required_params if not body.get(param)]
     return (True, "") if not missing else (False, f"Missing or empty required parameter(s): {', '.join(missing)}")
@@ -133,9 +147,21 @@ def lambda_handler(event, context):
         body = json.loads(event.get('body', '{}'))
         ip = event.get('requestContext', {}).get('http', {}).get('sourceIp', 'Unknown')
         body['timestamp'] = get_current_timestamp()
-
-        if path not in ['/auth', '/log'] and body.get('authKey') != ADMIN_KEY:
-            return respond(401, {'message': 'Unauthorized'})
+        
+        if not path.startswith('/auth') and not path.startswith('/log'):
+            if body.get('authKey') != ADMIN_KEY:
+                return respond(401, {'message': 'Unauthorized'})
+            
+        if path.startswith('/log/auth/'):
+            if body.get('authKey') != ADMIN_KEY:
+                return respond(401, {'message': 'Unauthorized'})
+            
+            path_params = event["pathParameters"]
+            if "user_id" not in path_params or not path_params["user_id"]:
+                return respond(400, {'message': 'Empty userId'})
+            if method == 'POST':
+                auth_logs = get_auth_logs(path_params["user_id"])
+                return respond(200, {'logs': auth_logs})
 
         if path == '/user':
             valid, error_message = validate_body(body, ['userId'])
