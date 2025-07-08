@@ -7,8 +7,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"strconv"
-	"time"
 
 	"github.com/joho/godotenv"
 	"github.com/spf13/cobra"
@@ -19,28 +17,20 @@ var (
 	adminKey string
 )
 
+// Response - API 응답을 위한 범용 구조체
 type Response struct {
-	Message string    `json:"message"`
-	Users   []User    `json:"users,omitempty"`
-	Logs    []AuthLog `json:"logs,omitempty"`
+	Message string `json:"message"`
+	Users   []User `json:"users,omitempty"`
 }
 
+// User - 사용자 정보를 담는 구조체
 type User struct {
 	UserID string `json:"userId"`
 }
 
-type AuthLog struct {
-	UserID    string `json:"userId"`
-	Message   string `json:"message"`
-	Timestamp string `json:"timestamp"`
-	DeviceID  string `json:"deviceId"`
-	Success   bool   `json:"success"`
-	IP        string `json:"ip"`
-}
-
 func init() {
 	if err := godotenv.Load(); err != nil {
-		fmt.Fprintln(os.Stderr, "Error loading .env file")
+		fmt.Fprintln(os.Stderr, "Error loading .env file:", err)
 	}
 
 	baseURL = os.Getenv("BASE_URL")
@@ -54,46 +44,82 @@ func init() {
 
 func main() {
 	rootCmd := &cobra.Command{Use: "usermanager"}
+
+	// 명령어 정의
 	rootCmd.AddCommand(
 		&cobra.Command{
 			Use:   "create [userId]",
 			Short: "Create a new user",
 			Args:  cobra.ExactArgs(1),
-			Run:   func(cmd *cobra.Command, args []string) { executeRequest("POST", "/user", args[0]) },
+			Run:   func(cmd *cobra.Command, args []string) { createUser(args[0]) },
+		},
+		&cobra.Command{
+			Use:   "list",
+			Short: "List all users",
+			Run:   func(cmd *cobra.Command, args []string) { listUsers() },
 		},
 		&cobra.Command{
 			Use:   "delete [userId]",
 			Short: "Delete a user",
 			Args:  cobra.ExactArgs(1),
-			Run:   func(cmd *cobra.Command, args []string) { executeRequest("DELETE", "/user", args[0]) },
+			Run:   func(cmd *cobra.Command, args []string) { deleteUser(args[0]) },
 		},
 		&cobra.Command{
 			Use:   "reset [userId]",
-			Short: "Reset user key",
+			Short: "Reset user session and login info",
 			Args:  cobra.ExactArgs(1),
-			Run:   func(cmd *cobra.Command, args []string) { executeRequest("PUT", "/user", args[0]) },
-		},
-		&cobra.Command{
-			Use:   "list",
-			Short: "List all users",
-			Run:   func(cmd *cobra.Command, args []string) { executeRequest("POST", "/users", "") },
-		},
-		&cobra.Command{
-			Use:   "auth-logs [userId]",
-			Short: "Get auth logs for a user",
-			Args:  cobra.ExactArgs(1),
-			Run:   func(cmd *cobra.Command, args []string) { getAuthLogs(args[0]) },
+			Run:   func(cmd *cobra.Command, args []string) { resetUser(args[0]) },
 		},
 	)
-	rootCmd.Execute()
+
+	if err := rootCmd.Execute(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 }
 
-func executeRequest(method, path, userId string) {
+// --- 명령어 실행 함수들 ---
+
+func createUser(userId string) {
+	payload := map[string]string{
+		"adminKey": adminKey,
+		"userId":   userId,
+	}
+	executeRequest("POST", "/admin/users/create", payload)
+}
+
+func listUsers() {
+	payload := map[string]string{
+		"adminKey": adminKey,
+	}
+	executeRequest("POST", "/admin/users/list", payload)
+}
+
+func deleteUser(userId string) {
+	payload := map[string]string{
+		"adminKey": adminKey,
+		"userId":   userId,
+	}
+	executeRequest("POST", "/admin/users/delete", payload)
+}
+
+func resetUser(userId string) {
+	payload := map[string]string{
+		"adminKey": adminKey,
+		"userId":   userId,
+	}
+	executeRequest("POST", "/admin/users/reset", payload)
+}
+
+// --- 핵심 요청 로직 (리팩토링하여 통합) ---
+func executeRequest(method, path string, payload interface{}) {
 	url := baseURL + path
-	requestBody, _ := json.Marshal(map[string]string{
-		"userId":  userId,
-		"authKey": adminKey,
-	})
+
+	requestBody, err := json.Marshal(payload)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error creating request body:", err)
+		return
+	}
 
 	req, err := http.NewRequest(method, url, bytes.NewBuffer(requestBody))
 	if err != nil {
@@ -111,82 +137,31 @@ func executeRequest(method, path, userId string) {
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "Error reading response:", err)
+		fmt.Fprintln(os.Stderr, "Error reading response body:", err)
+		return
+	}
+
+	if resp.StatusCode >= 400 {
+		fmt.Fprintf(os.Stderr, "Error from server (HTTP %d): %s\n", resp.StatusCode, string(body))
 		return
 	}
 
 	var response Response
 	if err := json.Unmarshal(body, &response); err != nil {
-		fmt.Fprintln(os.Stderr, "Error parsing response:", err)
+		fmt.Fprintln(os.Stderr, "Error parsing response JSON:", err)
+		fmt.Println("Raw response:", string(body)) // 디버깅을 위해 원본 응답 출력
 		return
 	}
 
+	// 결과 출력
 	if response.Message != "" {
-		fmt.Println("Response:", response.Message)
+		fmt.Println("Message:", response.Message)
 	}
 
 	if len(response.Users) > 0 {
 		fmt.Println("Users:")
 		for _, user := range response.Users {
-			fmt.Println("\t" + user.UserID)
+			fmt.Println("  -", user.UserID)
 		}
 	}
-}
-
-func getAuthLogs(userId string) {
-	url := fmt.Sprintf("%s/log/auth/%s", baseURL, userId)
-	requestBody, _ := json.Marshal(map[string]string{
-		"authKey": adminKey,
-	})
-
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(requestBody))
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "Error creating request:", err)
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "Error executing request:", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "Error reading response:", err)
-		return
-	}
-
-	var response Response
-	if err := json.Unmarshal(body, &response); err != nil {
-		fmt.Fprintln(os.Stderr, "Error parsing response:", err)
-		return
-	}
-
-	if response.Message != "" {
-		fmt.Println("Response:", response.Message)
-	}
-
-	if len(response.Logs) > 0 {
-		fmt.Println("Auth Logs:")
-		for _, log := range response.Logs {
-			kstTime := convertToKST(log.Timestamp)
-			fmt.Printf("\tUserID: %s\n\tMessage: %s\n\tTimestamp (KST): %s\n\tDeviceID: %s\n\tSuccess: %v\n\tIP: %s\n\n",
-				log.UserID, log.Message, kstTime, log.DeviceID, log.Success, log.IP)
-		}
-	} else {
-		fmt.Println("No logs found.")
-	}
-}
-
-func convertToKST(unixTimestamp string) string {
-	i, err := strconv.ParseInt(unixTimestamp, 10, 64)
-	if err != nil {
-		return "Invalid timestamp"
-	}
-	t := time.Unix(i, 0)
-	loc, _ := time.LoadLocation("Asia/Seoul")
-	return t.In(loc).Format("2006-01-02 15:04:05 MST")
 }

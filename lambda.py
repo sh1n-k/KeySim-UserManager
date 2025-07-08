@@ -1,212 +1,407 @@
+import http
 import json
-import boto3
 import os
+import random
+import threading
+import time
+import urllib
+import uuid
+
+import boto3
+from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
-from datetime import datetime, timezone
 
-# Initialize DynamoDB resource
-dynamodb = boto3.resource('dynamodb')
+# --- DynamoDB 및 환경 변수 설정 ---
+dynamodb = boto3.resource("dynamodb")
+users_table = dynamodb.Table(os.environ["USERS_TABLE_NAME"])
+sessions_table = dynamodb.Table(os.environ["SESSIONS_TABLE_NAME"])
+auth_logs_table = dynamodb.Table(os.environ["AUTH_LOGS_TABLE_NAME"])
 
-# Get table names from environment variables
-USERS_TABLE = os.environ['USERS_TABLE']
-AUTH_LOGS_TABLE = os.environ['AUTH_LOGS_TABLE']
-ACTIVITY_LOGS_TABLE = os.environ['ACTIVITY_LOGS_TABLE']
-ADMIN_KEY = os.environ['ADMIN_KEY']
+MAX_RETRIES = 3
+BASE_DELAY = 0.1
+LOG_RETENTION_DAYS = int(os.environ["LOG_RETENTION_DAYS"])
 
-def respond(statusCode, body):
-    return {
-        'statusCode': statusCode,
-        "headers": {"Content-Type": "application/json"},
-        'body': json.dumps(body)
-    }
+ADMIN_KEY = os.environ["ADMIN_KEY"]
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+CHAT_ID = os.environ["CHAT_ID"]
 
-def get_current_timestamp():
-    return str(int(datetime.now(timezone.utc).timestamp()))
+APP_VERSION = "2.1"
 
-def dynamodb_operation(table_name, operation, **kwargs):
-    table = dynamodb.Table(table_name)
-    try:
-        return getattr(table, operation)(**kwargs)
-    except ClientError as e:
-        print(f"Error in {operation} operation on {table_name}: {str(e)}")
-        raise
 
+# --- 메인 핸들러 ---
+def lambda_handler(event, context):
+    method, path = event["routeKey"].split()
+    body = json.loads(event.get("body", "{}"))
+    ip = event.get("requestContext", {}).get("http", {}).get("sourceIp", "Unknown")
+    
+    # --- 관리자 기능 라우팅 ---
+    if path.startswith("/admin/"):
+        if ADMIN_KEY != body.get("adminKey"):
+            return response(403, "Unauthorized: Invalid admin key")
+
+        user_id = body.get("userId") # 관리자 기능은 body에서 userId를 받음
+
+        if method == "POST" and path == "/admin/users/create":
+            return create_user(user_id)
+        if method == "POST" and path == "/admin/users/list":
+            return list_users()
+        if method == "POST" and path == "/admin/users/delete":
+            return delete_user(user_id)
+        if method == "POST" and path == "/admin/users/reset":
+            return reset_user(user_id)
+
+    # --- 기존 클라이언트 앱 기능 라우팅 ---
+    app_version = body.get("appVersion")
+    if APP_VERSION != app_version:
+        return response(400, "Update to the new version.")
+
+    user_id = body.get("userId")
+    if not user_id:
+        return response(400, "Missing userId")
+
+    if method == "POST" and path == "/authenticate":
+        return authenticate(user_id, ip)
+    elif method == "POST" and path == "/validate":
+        return validate_session(user_id, body.get("sessionToken"), ip)
+    elif method == "POST" and path == "/cleanup-logs":
+        # adminKey는 body에 있어야 함
+        if ADMIN_KEY != body.get("adminKey"):
+            return response(403, "Unauthorized")
+        return cleanup_old_logs()
+    elif method == "POST" and path == "/clear-logs":
+        if ADMIN_KEY != body.get("adminKey"):
+            return response(403, "Unauthorized")
+        return clear_logs()
+        
+    return response(404, "Not Found")
+
+# --- 신규 관리자 기능 ---
 def create_user(user_id):
+    if not user_id:
+        return response(400, "userId is required for creation")
     try:
-        dynamodb_operation(USERS_TABLE, 'put_item',
-            Item={'userId': user_id, 'deviceId': '', 'timestamp': get_current_timestamp()},
+        users_table.put_item(
+            Item={'userId': user_id, 'createdAt': int(time.time())},
             ConditionExpression='attribute_not_exists(userId)'
         )
-        return True
+        return response(200, f"User '{user_id}' created successfully.")
     except ClientError as e:
         if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
-            return False
-        raise
+            return response(409, f"User '{user_id}' already exists.")
+        print(f"Error in create_user: {e}")
+        return response(500, "Internal server error during user creation.")
+
+def list_users():
+    try:
+        # 참고: scan은 큰 테이블에서는 비효율적일 수 있습니다.
+        scan_response = users_table.scan(ProjectionExpression="userId")
+        users = scan_response.get("Items", [])
+        # 페이지네이션 처리
+        while "LastEvaluatedKey" in scan_response:
+            scan_response = users_table.scan(
+                ProjectionExpression="userId",
+                ExclusiveStartKey=scan_response["LastEvaluatedKey"]
+            )
+            users.extend(scan_response.get("Items", []))
+        return response(200, "Users listed successfully", {"users": users})
+    except Exception as e:
+        print(f"Error in list_users: {e}")
+        return response(500, "Internal server error while listing users.")
 
 def delete_user(user_id):
+    if not user_id:
+        return response(400, "userId is required for deletion")
     try:
-        response = dynamodb_operation(USERS_TABLE, 'delete_item', 
-            Key={'userId': user_id},
-            ReturnValues='ALL_OLD'
-        )
-        return 'Attributes' in response
-    except ClientError:
-        return False
+        users_table.delete_item(Key={'userId': user_id})
+        return response(200, f"User '{user_id}' deleted successfully.")
+    except Exception as e:
+        print(f"Error in delete_user: {e}")
+        return response(500, "Internal server error during user deletion.")
 
-def reset_user_key(user_id):
+def reset_user(user_id):
+    if not user_id:
+        return response(400, "userId is required for reset")
     try:
-        response = dynamodb_operation(USERS_TABLE, 'update_item',
+        # 1. 세션 테이블에서 해당 사용자의 모든 세션 삭제
+        session_query = sessions_table.query(KeyConditionExpression=Key('userId').eq(user_id))
+        with sessions_table.batch_writer() as batch:
+            for item in session_query.get("Items", []):
+                batch.delete_item(Key={'userId': item['userId']})
+        
+        # 2. 사용자 테이블에서 lastLogin, lastIpAddress 제거(리셋)
+        users_table.update_item(
             Key={'userId': user_id},
-            UpdateExpression='SET deviceId = :val',
-            ExpressionAttributeValues={':val': ''},
-            ConditionExpression='attribute_exists(userId)',
-            ReturnValues='UPDATED_OLD'
+            UpdateExpression="REMOVE lastLogin, lastIpAddress",
+            ConditionExpression="attribute_exists(userId)"
         )
-        return True
+        return response(200, f"User '{user_id}' has been reset successfully.")
     except ClientError as e:
+        # 사용자가 존재하지 않을 때 발생하는 오류를 잡아서 404로 응답
         if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
-            return False
-        raise
+            return response(404, f"User '{user_id}' not found.")
+        print(f"Error in reset_user: {e}")
+        return response(500, "Internal server error during user reset.")
+    except Exception as e:
+        print(f"Error in reset_user: {e}")
+        return response(500, "Internal server error during user reset.")
 
-def get_users():
-    return dynamodb_operation(USERS_TABLE, 'scan')['Items']
 
-def authenticate_user(user_id, device_id, timestamp, ip):
+# --- 기존 기능 (일부 수정 포함) ---
+def authenticate(user_id, ip):
+    # (내용 변경 없음, 원본과 동일)
     try:
-        user = dynamodb_operation(USERS_TABLE, 'get_item', Key={'userId': user_id}).get('Item')
-        if not user:
-            log_auth(user_id, '403: User not found', device_id, timestamp, False, ip)
-            return 403
-        if not user['deviceId']:
-            dynamodb_operation(USERS_TABLE, 'update_item',
-                Key={'userId': user_id},
-                UpdateExpression='SET deviceId = :val',
-                ExpressionAttributeValues={':val': device_id}
-            )
-            log_auth(user_id, '200: Register a device ID', device_id, timestamp, True, ip)
-            return 200
-        if user['deviceId'] == device_id:
-            log_auth(user_id, '200: Authentication request', device_id, timestamp, True, ip)
-            return 200
-        log_auth(user_id, '401: Authentication failure', device_id, timestamp, False, ip)
-        return 401
-    except ClientError as e:
-        print(f"Error in authenticate_user: {str(e)}")
-        log_auth(user_id, '500: Internal server error', device_id, timestamp, False, ip)
-        return 500
+        user = retry_operation(users_table.get_item, Key={"userId": user_id})
+        if "Item" not in user:
+            send_telegram_message(user_id, ip, "Authentication failed")
+            return response(401, "Authentication failed")
 
-def log_auth(user_id, message, device_id, timestamp, success, ip):
-    try:
-        dynamodb_operation(AUTH_LOGS_TABLE, 'put_item',
+        current_time = int(time.time())
+        session_token = str(uuid.uuid4())
+
+        retry_operation(
+            sessions_table.put_item,
             Item={
-                'userId': user_id,
-                'message': message,
-                'timestamp': timestamp,
-                'deviceId': device_id,
-                'success': success,
-                'ip': ip
-            }
-        )
-    except ClientError as e:
-        print(f"Error in log_auth: {str(e)}")
-
-def log_activity(user_id, message, timestamp, ip):
-    try:
-        dynamodb_operation(ACTIVITY_LOGS_TABLE, 'put_item',
-            Item={
-                'userId': user_id,
-                'timestamp': timestamp,
-                'message': message,
-                'ip': ip
-            }
-        )
-    except ClientError as e:
-        print(f"Error in log_activity: {str(e)}")
-
-def get_auth_logs(user_id):
-    try:
-        response = dynamodb_operation(AUTH_LOGS_TABLE, 'query',
-            KeyConditionExpression='userId = :userId',
-            ExpressionAttributeValues={
-                ':userId': user_id,
+                "userId": user_id,
+                "sessionToken": session_token,
+                "expirationTime": current_time + 720,
+                "createdAt": current_time,
+                "lastAccessedAt": current_time,
+                "lastIpAddress": ip,
             },
         )
-        return response.get('Items', [])
-    except ClientError as e:
-        print(f"Error in get_auth_logs: {str(e)}")
-        raise
-
-
-def validate_body(body, required_params):
-    missing = [param for param in required_params if not body.get(param)]
-    return (True, "") if not missing else (False, f"Missing or empty required parameter(s): {', '.join(missing)}")
-
-def lambda_handler(event, context):
-    try:
-        method, path = event['routeKey'].split()
-        body = json.loads(event.get('body', '{}'))
-        ip = event.get('requestContext', {}).get('http', {}).get('sourceIp', 'Unknown')
-        body['timestamp'] = get_current_timestamp()
-        
-        if not path.startswith('/auth') and not path.startswith('/log'):
-            if body.get('authKey') != ADMIN_KEY:
-                return respond(401, {'message': 'Unauthorized'})
-            
-        if path.startswith('/log/auth/'):
-            if body.get('authKey') != ADMIN_KEY:
-                return respond(401, {'message': 'Unauthorized'})
-            
-            path_params = event["pathParameters"]
-            if "user_id" not in path_params or not path_params["user_id"]:
-                return respond(400, {'message': 'Empty userId'})
-            if method == 'POST':
-                auth_logs = get_auth_logs(path_params["user_id"])
-                return respond(200, {'logs': auth_logs})
-
-        if path == '/user':
-            valid, error_message = validate_body(body, ['userId'])
-            if not valid:
-                return respond(400, {'message': error_message})
-            
-            if method == 'POST':
-                if create_user(body['userId']):
-                    return respond(201, {'message': 'User created'})
-                else:
-                    return respond(409, {'message': 'User already exists'})
-            elif method == 'DELETE':
-                if delete_user(body['userId']):
-                    return respond(200, {'message': 'User deleted'})
-                else:
-                    return respond(404, {'message': 'User not found'})
-            elif method == 'PUT':
-                if reset_user_key(body['userId']):
-                    return respond(200, {'message': 'User key reset'})
-                else:
-                    return respond(404, {'message': 'User not found'})
-
-        elif path == '/users' and method == 'POST':
-            return respond(200, {'users': get_users()})
-
-        elif path == '/auth' and method == 'POST':
-            valid, error_message = validate_body(body, ['userId', 'deviceId'])
-            if not valid:
-                return respond(400, {'message': error_message})
-            if len(body["deviceId"]) != 36:
-                return respond(401, {'message': 'Invalid Device ID'})
-
-            status = authenticate_user(body['userId'], body['deviceId'], body['timestamp'], ip)
-            messages = {200: 'Authentication successful', 401: 'Device ID mismatch', 403: 'User not found', 500: 'Internal server error'}
-            return respond(status, {'message': messages.get(status, 'Unknown error')})
-
-        elif path == '/log' and method == 'POST':
-            valid, error_message = validate_body(body, ['userId', 'message'])
-            if not valid:
-                return respond(400, {'message': error_message})
-            log_activity(body['userId'], body['message'], body['timestamp'], ip)
-            return respond(200, {'message': 'Log recorded'})
-
-        return respond(404, {'message': 'Not found'})
-
+        retry_operation(
+            users_table.update_item,
+            Key={"userId": user_id},
+            UpdateExpression="SET lastLogin = :time, lastIpAddress = :ip",
+            ExpressionAttributeValues={":time": current_time, ":ip": ip},
+        )
+        log_auth_request(user_id, "authenticate", ip, "success")
+        send_telegram_message(user_id, ip, "Authentication successful")
+        return response(
+            200, "Authentication successful", {"sessionToken": session_token}
+        )
     except Exception as e:
-        print(f"Unexpected error in lambda_handler: {str(e)}")
-        return respond(500, {'message': 'Internal server error'})
+        print(f"Error in authenticate: {str(e)}")
+        log_auth_request(user_id, "authenticate", ip, "error")
+        send_telegram_message(user_id, ip, f"Internal server error: {str(e)}")
+        return response(500, "Internal server error")
+
+
+def validate_session(user_id, session_token, ip):
+    if not session_token:
+        return response(400, "Missing sessionToken")
+    try:
+        # BUG FIX: get_item이 아닌 query를 사용해야 함
+        session_response = retry_operation(
+            sessions_table.query,
+            KeyConditionExpression=Key('userId').eq(user_id) & Key('sessionToken').eq(session_token)
+        )
+        
+        if not session_response.get("Items"):
+            log_auth_request(user_id, "validate", ip, "invalid")
+            send_telegram_message(user_id, ip, "Invalid session")
+            return response(401, "Invalid session")
+        
+        session_item = session_response["Items"][0]
+        current_time = int(time.time())
+
+        if current_time > session_item["expirationTime"]:
+            # 세션이 만료된 경우 isExpired 같은 플래그 대신 그냥 삭제하는 것이 더 깔끔할 수 있습니다.
+            # 여기서는 원본 로직을 유지합니다.
+            retry_operation(
+                sessions_table.update_item,
+                Key={"userId": user_id, "sessionToken": session_token},
+                UpdateExpression="SET isExpired = :expired",
+                ExpressionAttributeValues={":expired": True},
+            )
+            log_auth_request(user_id, "validate", ip, "expired")
+            send_telegram_message(user_id, ip, "Session expired")
+            return response(401, "Session expired")
+
+        retry_operation(
+            sessions_table.update_item,
+            Key={"userId": user_id, "sessionToken": session_token},
+            UpdateExpression="SET lastAccessedAt = :time, lastIpAddress = :ip, expirationTime = :new_expiration",
+            ExpressionAttributeValues={
+                ":time": current_time,
+                ":ip": ip,
+                ":new_expiration": current_time + 900,
+            },
+        )
+        log_auth_request(user_id, "validate", ip, "success")
+        return response(200, "Session is valid")
+    except Exception as e:
+        print(f"Error in validate_session: {str(e)}")
+        send_telegram_message(user_id, ip, f"Internal server error: {str(e)}")
+        return response(500, "Internal server error")
+
+
+def clear_logs():
+    try:
+        # Clear logs from auth_logs_table
+        scan_response = auth_logs_table.scan()
+
+        with auth_logs_table.batch_writer() as batch:
+            for item in scan_response["Items"]:
+                batch.delete_item(
+                    Key={
+                        "userIdTimestamp": item["userIdTimestamp"],
+                        "timestamp": item["timestamp"],
+                    }
+                )
+
+        # Check if there are more items to process in auth_logs_table
+        while "LastEvaluatedKey" in scan_response:
+            scan_response = auth_logs_table.scan(
+                ExclusiveStartKey=scan_response["LastEvaluatedKey"]
+            )
+
+            with auth_logs_table.batch_writer() as batch:
+                for item in scan_response["Items"]:
+                    batch.delete_item(
+                        Key={
+                            "userIdTimestamp": item["userIdTimestamp"],
+                            "timestamp": item["timestamp"],
+                        }
+                    )
+
+        # Clear logs from sessions_table
+        scan_response = sessions_table.scan()
+
+        with sessions_table.batch_writer() as batch:
+            for item in scan_response["Items"]:
+                batch.delete_item(
+                    Key={"userId": item["userId"], "sessionToken": item["sessionToken"]}
+                )
+
+        # Check if there are more items to process in sessions_table
+        while "LastEvaluatedKey" in scan_response:
+            scan_response = sessions_table.scan(
+                ExclusiveStartKey=scan_response["LastEvaluatedKey"]
+            )
+
+            with sessions_table.batch_writer() as batch:
+                for item in scan_response["Items"]:
+                    batch.delete_item(
+                        Key={
+                            "userId": item["userId"],
+                            "sessionToken": item["sessionToken"],
+                        }
+                    )
+
+        return response(200, "Logs cleared successfully")
+    except Exception as e:
+        print(f"Error in clear_logs: {str(e)}")
+        return response(500, "Internal server error while clearing logs")
+
+
+def retry_operation(operation, **kwargs):
+    retries = 0
+    while retries < MAX_RETRIES:
+        try:
+            return operation(**kwargs)
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ProvisionedThroughputExceededException":
+                sleep_time = (2**retries * BASE_DELAY) + (
+                    random.random() * BASE_DELAY
+                )
+                time.sleep(sleep_time)
+                retries += 1
+            else:
+                raise
+    raise Exception("Max retries exceeded")
+
+
+def log_auth_request(user_id, action, ip, status):
+    current_time = int(time.time())
+    expiration_time = current_time + (
+        LOG_RETENTION_DAYS * 24 * 60 * 60
+    )  # TTL in seconds
+
+    # Create a composite key: userId#timestamp
+    composite_key = f"{user_id}#{current_time}"
+
+    log_item = {
+        "userIdTimestamp": composite_key,  # Partition key
+        "timestamp": current_time,  # Sort key
+        "action": action,
+        "status": status,
+        "ip": ip,
+    }
+
+    retry_operation(auth_logs_table.put_item, Item=log_item)
+
+
+def cleanup_old_logs():
+    current_time = int(time.time())
+    cutoff_time = current_time - (LOG_RETENTION_DAYS * 24 * 60 * 60)
+
+    try:
+        # Scan the table for old logs
+        scan_response = auth_logs_table.scan(
+            FilterExpression=Key("timestamp").lt(cutoff_time)
+        )
+
+        with auth_logs_table.batch_writer() as batch:
+            for item in scan_response["Items"]:
+                batch.delete_item(
+                    Key={
+                        "userIdTimestamp": item["userIdTimestamp"],
+                        "timestamp": item["timestamp"],
+                    }
+                )
+
+        # Check if there are more items to process
+        while "LastEvaluatedKey" in scan_response:
+            scan_response = auth_logs_table.scan(
+                FilterExpression=Key("timestamp").lt(cutoff_time),
+                ExclusiveStartKey=scan_response["LastEvaluatedKey"],
+            )
+
+            with auth_logs_table.batch_writer() as batch:
+                for item in scan_response["Items"]:
+                    batch.delete_item(
+                        Key={
+                            "userIdTimestamp": item["userIdTimestamp"],
+                            "timestamp": item["timestamp"],
+                        }
+                    )
+
+        return response(
+            200, f"Logs older than {LOG_RETENTION_DAYS} days have been removed"
+        )
+    except Exception as e:
+        print(f"Error in cleanup_old_logs: {str(e)}")
+        return response(500, "Internal server error during log cleanup")
+
+
+def response(status_code, message, additional_data=None):
+    body = {"message": message}
+    if additional_data:
+        body.update(additional_data)
+    return {"statusCode": status_code, "body": json.dumps(body)}
+
+
+def send_telegram_message(user_id, ip, status):
+    thread = threading.Thread(
+        target=send_telegram_message_async, args=(user_id, ip, status)
+    )
+    thread.start()
+    thread.join(timeout=2)
+
+
+def send_telegram_message_async(user_id, ip, status):
+    try:
+        message = f"User ID: {user_id}\nIP: {ip}\nStatus: {status}"
+        encoded_message = urllib.parse.quote(message)
+
+        url = f"api.telegram.org"
+        path = f"/bot{BOT_TOKEN}/sendMessage?chat_id={CHAT_ID}&text={encoded_message}"
+
+        conn = http.client.HTTPSConnection(url)
+        conn.request("GET", path)
+        telegram_response = conn.getresponse()
+        telegram_response.read()
+        conn.close()
+    except Exception as e:
+        print(f"Error sending message to Telegram: {str(e)}")
