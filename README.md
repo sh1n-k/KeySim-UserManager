@@ -1,3 +1,7 @@
+![Go](https://img.shields.io/badge/Go-1.22.6-00ADD8?logo=go&logoColor=white)
+![License](https://img.shields.io/github/license/sh1n-k/KeySim-UserManager)
+![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)
+
 # User Management CLI Admin Tool
 
 This CLI application is a powerful administrative tool designed to manage users for a remote backend service, such as an AWS Lambda-based authentication system. It provides straightforward command-line functionalities for user lifecycle management.
