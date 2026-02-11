@@ -1,6 +1,19 @@
+# Secrets
 .env
-*.txt
-*.exe
-usermanager
 
+# Build artifacts
+*.exe
+*.txt
+usermanager
+usermanager-arm
+keysim-admin
+
+# OS
 .DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# Claude Code
+.claude/

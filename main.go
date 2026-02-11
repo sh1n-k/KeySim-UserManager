@@ -12,6 +12,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
+const appVersion = "3.0"
+
 var (
 	baseURL  string
 	adminKey string
@@ -70,6 +72,16 @@ func main() {
 			Args:  cobra.ExactArgs(1),
 			Run:   func(cmd *cobra.Command, args []string) { resetUser(args[0]) },
 		},
+		&cobra.Command{
+			Use:   "cleanup-logs",
+			Short: "Remove old authentication logs",
+			Run:   func(cmd *cobra.Command, args []string) { cleanupLogs() },
+		},
+		&cobra.Command{
+			Use:   "clear-logs",
+			Short: "Clear all logs and sessions",
+			Run:   func(cmd *cobra.Command, args []string) { clearLogs() },
+		},
 	)
 
 	if err := rootCmd.Execute(); err != nil {
@@ -109,6 +121,24 @@ func resetUser(userId string) {
 		"userId":   userId,
 	}
 	executeRequest("POST", "/admin/users/reset", payload)
+}
+
+func cleanupLogs() {
+	payload := map[string]string{
+		"adminKey":   adminKey,
+		"appVersion": appVersion,
+		"userId":     "admin",
+	}
+	executeRequest("POST", "/cleanup-logs", payload)
+}
+
+func clearLogs() {
+	payload := map[string]string{
+		"adminKey":   adminKey,
+		"appVersion": appVersion,
+		"userId":     "admin",
+	}
+	executeRequest("POST", "/clear-logs", payload)
 }
 
 // --- 핵심 요청 로직 (리팩토링하여 통합) ---
