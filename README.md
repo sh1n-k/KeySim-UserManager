@@ -1,8 +1,8 @@
-![Go](https://img.shields.io/badge/Go-1.22.6-00ADD8?logo=go&logoColor=white)
-![License](https://img.shields.io/github/license/sh1n-k/KeySim-UserManager)
-![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)
-
 # User Management CLI Admin Tool
+
+![Go](https://img.shields.io/badge/Go-1.22.6-00ADD8?logo=go&logoColor=white)
+![AWS Lambda](https://img.shields.io/badge/AWS%20Lambda-serverless-FF9900?logo=awslambda&logoColor=white)
+![API Gateway](https://img.shields.io/badge/API%20Gateway-REST-8C4FFF?logo=amazonapigateway&logoColor=white)
 
 [한국어](#korean) | [English](#english)
 
